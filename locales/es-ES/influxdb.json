@@ -25,6 +25,7 @@
             "nomeasurement":"No se ha especificado una medición",
             "missingconfig":"Configuración incompleta",
             "invalidconfig":"Configuration no válida",
+            "invalidtoken":"El token/credenciales de InfluxDB están vacíos o tienen caracteres inválidos. Vuelve a pegar el token sin saltos de línea.",
             "noquery":"No query"
         },
         "tip": {

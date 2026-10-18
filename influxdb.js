@@ -1,4 +1,6 @@
 var _ = require('lodash');
+var http = require('http');
+var https = require('https');
 
 module.exports = function (RED) {
     "use strict";
@@ -8,6 +10,81 @@ module.exports = function (RED) {
     const VERSION_1X = '1.x';
     const VERSION_18_FLUX = '1.8-flux';
     const VERSION_20 = '2.0';
+    const STATUS_CHECK_INTERVAL_MS = 30000;
+
+    const STATUS_CONNECTING = { fill: "yellow", shape: "ring", text: "node-red:common.status.connecting" };
+    const STATUS_CONNECTED = { fill: "green", shape: "dot", text: "node-red:common.status.connected" };
+    const STATUS_DISCONNECTED = { fill: "red", shape: "ring", text: "node-red:common.status.disconnected" };
+
+    function isConnectionError(err) {
+        if (!err) {
+            return false;
+        }
+        var code = err.code || (err.cause && err.cause.code);
+        if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH'].indexOf(code) !== -1) {
+            return true;
+        }
+        var statusCode = err.statusCode || (err.res && err.res.statusCode);
+        if (statusCode === 401 || statusCode === 403 || statusCode >= 500) {
+            return true;
+        }
+        if (err.message && /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|network|socket hang up|connect/i.test(err.message)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Credentials pasted into Node-RED often include trailing newlines or
+     * other control chars that make Node throw ERR_INVALID_CHAR when setting
+     * the Authorization header — an uncaught exception that kills the runtime.
+     */
+    function sanitizeCredential(value) {
+        if (value == null) {
+            return '';
+        }
+        return String(value).replace(/[\r\n\0\x08\x0B\x0C\x1F\x7F]/g, '').trim();
+    }
+
+    function isValidHttpHeaderValue(value) {
+        // Same rule Node uses for setHeader (latin1 printable + tab)
+        return typeof value === 'string' && value.length > 0 && !/[^\t\x20-\x7e\x80-\xff]/.test(value);
+    }
+
+    function pingHttpUrl(baseUrl, timeoutMs, rejectUnauthorized) {
+        return new Promise(function (resolve, reject) {
+            try {
+                var pingUrl = new URL(baseUrl);
+                pingUrl.pathname = '/ping';
+                pingUrl.search = '';
+                var lib = pingUrl.protocol === 'https:' ? https : http;
+                var req = lib.request({
+                    protocol: pingUrl.protocol,
+                    hostname: pingUrl.hostname,
+                    port: pingUrl.port || (pingUrl.protocol === 'https:' ? 443 : 80),
+                    path: pingUrl.pathname,
+                    method: 'GET',
+                    timeout: timeoutMs,
+                    rejectUnauthorized: rejectUnauthorized !== false
+                }, function (res) {
+                    res.resume();
+                    if (res.statusCode === 204 || res.statusCode === 200) {
+                        resolve();
+                    } else {
+                        reject(new Error('HTTP ' + res.statusCode));
+                    }
+                });
+                req.on('error', reject);
+                req.on('timeout', function () {
+                    req.destroy();
+                    reject(new Error('timeout'));
+                });
+                req.end();
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
 
     /**
      * Config node. Currently we only connect to one host.
@@ -18,12 +95,23 @@ module.exports = function (RED) {
         this.port = n.port;
         this.database = n.database;
         this.name = n.name;
+        this.users = {};
+        this.connected = false;
+        this.currentStatus = STATUS_DISCONNECTED;
+        this.checkTimer = null;
+        this.checking = false;
 
+        var node = this;
         var clientOptions = null;
         
         if (!n.influxdbVersion) {
             n.influxdbVersion = VERSION_1X;
         }
+
+        var credentials = this.credentials || {};
+        var username = sanitizeCredential(credentials.username);
+        var password = sanitizeCredential(credentials.password);
+        var tokenCredential = sanitizeCredential(credentials.token);
 
         if (n.influxdbVersion === VERSION_1X) {
             this.usetls = n.usetls;
@@ -49,25 +137,138 @@ module.exports = function (RED) {
                     options: this.hostOptions
                 }],
                 database: this.database,
-                username: this.credentials.username,
-                password: this.credentials.password
+                username: username,
+                password: password
             });
         } else if (n.influxdbVersion === VERSION_18_FLUX || n.influxdbVersion === VERSION_20) {
             const timeout =  Math.floor(+(n.timeout?n.timeout:10)*1000) // convert from seconds to milliseconds
 
             const token = n.influxdbVersion === VERSION_18_FLUX ?
-                `${this.credentials.username}:${this.credentials.password}` :
-                this.credentials.token;
+                `${username}:${password}` :
+                tokenCredential;
 
-            clientOptions = {
-                url: n.url,
-                token,
-                timeout,
-                rejectUnauthorized: n.rejectUnauthorized
+            this.url = n.url;
+            this.timeout = timeout;
+            this.rejectUnauthorized = n.rejectUnauthorized;
+
+            if (!isValidHttpHeaderValue(token)) {
+                this.error(RED._("influxdb.errors.invalidtoken"));
+                this.client = null;
+            } else {
+                clientOptions = {
+                    url: n.url,
+                    token,
+                    timeout,
+                    rejectUnauthorized: n.rejectUnauthorized
+                }
+                this.client = new InfluxDB(clientOptions);
             }
-            this.client = new InfluxDB(clientOptions);
         }
         this.influxdbVersion = n.influxdbVersion;
+
+        this.setStatus = function (status) {
+            node.currentStatus = status;
+            for (var id in node.users) {
+                if (Object.prototype.hasOwnProperty.call(node.users, id)) {
+                    node.users[id].status(status);
+                }
+            }
+        };
+
+        this.markConnected = function () {
+            node.connected = true;
+            node.setStatus(STATUS_CONNECTED);
+        };
+
+        this.markDisconnected = function () {
+            node.connected = false;
+            node.setStatus(STATUS_DISCONNECTED);
+        };
+
+        this.reportSuccess = function () {
+            if (!node.connected) {
+                node.markConnected();
+            }
+        };
+
+        this.reportError = function (err) {
+            if (isConnectionError(err)) {
+                node.markDisconnected();
+                node.checkConnection();
+            }
+        };
+
+        this.checkConnection = function () {
+            if (!node.client || node.checking) {
+                return Promise.resolve();
+            }
+            node.checking = true;
+            var checkPromise;
+
+            if (node.influxdbVersion === VERSION_1X) {
+                checkPromise = node.client.ping(5000).then(function (hosts) {
+                    var online = hosts.some(function (host) { return host.online; });
+                    if (!online) {
+                        throw new Error('offline');
+                    }
+                });
+            } else {
+                checkPromise = pingHttpUrl(node.url, node.timeout || 10000, node.rejectUnauthorized);
+            }
+
+            return checkPromise.then(function () {
+                node.markConnected();
+            }).catch(function () {
+                node.markDisconnected();
+            }).finally(function () {
+                node.checking = false;
+            });
+        };
+
+        this.startStatusMonitor = function () {
+            if (node.checkTimer) {
+                return;
+            }
+            node.setStatus(STATUS_CONNECTING);
+            node.checkConnection();
+            node.checkTimer = setInterval(function () {
+                node.checkConnection();
+            }, STATUS_CHECK_INTERVAL_MS);
+        };
+
+        this.stopStatusMonitor = function () {
+            if (node.checkTimer) {
+                clearInterval(node.checkTimer);
+                node.checkTimer = null;
+            }
+        };
+
+        this.register = function (influxNode) {
+            node.users[influxNode.id] = influxNode;
+            if (Object.keys(node.users).length === 1) {
+                node.startStatusMonitor();
+            } else {
+                influxNode.status(node.currentStatus);
+            }
+        };
+
+        this.deregister = function (influxNode, done) {
+            delete node.users[influxNode.id];
+            if (Object.keys(node.users).length === 0) {
+                node.stopStatusMonitor();
+                node.connected = false;
+            }
+            if (done) {
+                done();
+            }
+        };
+
+        this.on('close', function (done) {
+            node.stopStatusMonitor();
+            node.users = {};
+            node.connected = false;
+            done();
+        });
     }
 
     RED.nodes.registerType("influxdb", InfluxConfigNode, {
@@ -199,11 +400,25 @@ module.exports = function (RED) {
 
         if (!this.influxdbConfig) {
             this.error(RED._("influxdb.errors.missingconfig"));
+            this.status(STATUS_DISCONNECTED);
+            return;
+        }
+        if (!this.influxdbConfig.client) {
+            this.error(RED._("influxdb.errors.invalidtoken"));
+            this.status(STATUS_DISCONNECTED);
             return;
         }
         let version = this.influxdbConfig.influxdbVersion;
 
         var node = this;
+        this.influxdbConfig.register(this);
+        this.on('close', function (done) {
+            if (node.influxdbConfig) {
+                node.influxdbConfig.deregister(node, done);
+            } else {
+                done();
+            }
+        });
 
         if (version === VERSION_1X) {
             var client = this.influxdbConfig.client;
@@ -287,11 +502,13 @@ module.exports = function (RED) {
                 }
 
                 client.writePoints(points, writeOptions).then(() => {
+                    node.influxdbConfig.reportSuccess();
                     done();
                 }).catch(function (err) {
                     msg.influx_error = {
                         statusCode: err.res ? err.res.statusCode : 503
                     }
+                    node.influxdbConfig.reportError(err);
                     done(err);
                 });
             });
@@ -306,7 +523,14 @@ module.exports = function (RED) {
             this.client = this.influxdbConfig.client.getWriteApi(org, bucket, this.precisionV18FluxV20);
 
             node.on("input", function (msg, send, done) {
-                writePoints(msg, node, done);
+                writePoints(msg, node, function (err) {
+                    if (err) {
+                        node.influxdbConfig.reportError(err);
+                    } else {
+                        node.influxdbConfig.reportSuccess();
+                    }
+                    done(err);
+                });
             });
         }
     }
@@ -333,11 +557,25 @@ module.exports = function (RED) {
 
         if (!this.influxdbConfig) {
             this.error(RED._("influxdb.errors.missingconfig"));
+            this.status(STATUS_DISCONNECTED);
+            return;
+        }
+        if (!this.influxdbConfig.client) {
+            this.error(RED._("influxdb.errors.invalidtoken"));
+            this.status(STATUS_DISCONNECTED);
             return;
         }
         let version = this.influxdbConfig.influxdbVersion;
 
         var node = this;
+        this.influxdbConfig.register(this);
+        this.on('close', function (done) {
+            if (node.influxdbConfig) {
+                node.influxdbConfig.deregister(node, done);
+            } else {
+                done();
+            }
+        });
 
         if (version === VERSION_1X) {
             var client = this.influxdbConfig.client;
@@ -356,11 +594,13 @@ module.exports = function (RED) {
                 }
 
                 client.writePoints(msg.payload, writeOptions).then(() => {
+                    node.influxdbConfig.reportSuccess();
                     done();
                 }).catch(function (err) {
                     msg.influx_error = {
                         statusCode: err.res ? err.res.statusCode : 503
                     }
+                    node.influxdbConfig.reportError(err);
                     done(err);
                 });
             });
@@ -396,11 +636,13 @@ module.exports = function (RED) {
 
                 // ensure we write everything including scheduled retries
                 client.flush(true).then(() => {
+                        node.influxdbConfig.reportSuccess();
                         done();
                     }).catch(error => {
                         msg.influx_error = {
                             errorMessage: error
                         };
+                        node.influxdbConfig.reportError(error);
                         done(error);
                     });
             });
@@ -424,12 +666,27 @@ module.exports = function (RED) {
 
         if (!this.influxdbConfig) {
             this.error(RED._("influxdb.errors.missingconfig"));
+            this.status(STATUS_DISCONNECTED);
+            return;
+        }
+        if (!this.influxdbConfig.client) {
+            this.error(RED._("influxdb.errors.invalidtoken"));
+            this.status(STATUS_DISCONNECTED);
             return;
         }
 
         let version = this.influxdbConfig.influxdbVersion
+        var node = this;
+        this.influxdbConfig.register(this);
+        this.on('close', function (done) {
+            if (node.influxdbConfig) {
+                node.influxdbConfig.deregister(node, done);
+            } else {
+                done();
+            }
+        });
+
         if (version === VERSION_1X) {
-            var node = this;
             var client = this.influxdbConfig.client;
 
             node.on("input", function (msg, send, done) {
@@ -464,12 +721,14 @@ module.exports = function (RED) {
 
                 queryPromise.then(function (results) {
                     msg.payload = results;
+                    node.influxdbConfig.reportSuccess();
                     send(msg);
                     done();
                 }).catch(function (err) {
                     msg.influx_error = {
                         statusCode: err.res ? err.res.statusCode : 503
                     }
+                    node.influxdbConfig.reportError(err);
                     done(err);
                 });
             });
@@ -477,7 +736,6 @@ module.exports = function (RED) {
         } else if (version === VERSION_18_FLUX || version === VERSION_20) {
             let org = version === VERSION_20 ? this.org : ''
             this.client = this.influxdbConfig.client.getQueryApi(org);
-            var node = this;
 
             node.on("input", function (msg, send, done) {
                 var query = msg.hasOwnProperty('query') ? msg.query : node.query;
@@ -494,10 +752,12 @@ module.exports = function (RED) {
                         msg.influx_error = {
                             errorMessage: error
                         };
+                        node.influxdbConfig.reportError(error);
                         done(error);
                     },
                     complete() {
                         msg.payload = output;
+                        node.influxdbConfig.reportSuccess();
                         send(msg);
                         done();
                     },

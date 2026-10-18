@@ -25,6 +25,7 @@
             "nomeasurement":"No measurement specified",
             "missingconfig":"Configuration missing",
             "invalidconfig":"Configuration invalid",
+            "invalidtoken":"InfluxDB token/credentials contain invalid characters or are empty. Re-paste the token without line breaks.",
             "noquery":"No query"
         },
         "tip": {
